@@ -1,0 +1,281 @@
+name: 'Busbar Anonymize & Extract'
+description: 'Extract data from a source Salesforce org, anonymize it, and load it into a target sandbox'
+author: 'busbar.agency'
+branding:
+  icon: 'shuffle'
+  color: 'green'
+
+inputs:
+  source-access-token:
+    description: 'Access token for the SOURCE org (extract from). Provide via secret.'
+    required: true
+  source-instance-url:
+    description: 'Instance URL for the SOURCE org.'
+    required: true
+  target-access-token:
+    description: 'Access token for the TARGET org (load into). Provide via secret. Required unless dry-run=true.'
+    required: false
+    default: ''
+  target-instance-url:
+    description: 'Instance URL for the TARGET org. Required unless dry-run=true.'
+    required: false
+    default: ''
+
+  config-file:
+    description: 'Pipeline config (YAML): extraction mapping, anonymization rules, load settings.'
+    required: true
+
+  dry-run:
+    description: 'Extract and anonymize but do NOT load into the target org.'
+    required: false
+    default: 'false'
+
+  snapshot:
+    description: 'Snapshot the target objects before load so the run can be rolled back.'
+    required: false
+    default: 'true'
+  rollback-on-failure:
+    description: 'If the load partially fails, roll the target back to the pre-load snapshot.'
+    required: false
+    default: 'true'
+
+  validate-residual-pii:
+    description: 'Run the PII validator on the anonymized data BEFORE loading. Aborts the load if the threshold is breached.'
+    required: false
+    default: 'true'
+  residual-pii-fail-on:
+    description: 'Abort load if anonymized data still contains PII at or above this severity. Same scale as pii-scan.'
+    required: false
+    default: 'high'
+
+  output-dir:
+    description: 'Where extracted data, anonymized data, and the run report are written.'
+    required: false
+    default: '.busbar/pipeline-runs'
+
+  upload-artifact:
+    description: 'Upload the run report (NOT the data) as a workflow artifact.'
+    required: false
+    default: 'true'
+  artifact-name:
+    description: 'Artifact name when upload-artifact=true.'
+    required: false
+    default: 'pipeline-run'
+  upload-data:
+    description: 'Also upload the extracted+anonymized data as an artifact. Off by default — anonymized data can still be sensitive.'
+    required: false
+    default: 'false'
+
+  version:
+    description: 'busbar-sf release tag to download (e.g. v0.4.2). "latest" resolves the most recent release.'
+    required: false
+    default: 'latest'
+  binary-repo:
+    description: 'GitHub repo that publishes the busbar-sf binary releases.'
+    required: false
+    default: 'busbar-actions/actions-dist'
+
+outputs:
+  status:
+    description: 'One of: success, dry-run, residual-pii-blocked, failed, rolled-back.'
+    value: ${{ steps.run.outputs.status }}
+  operation-id:
+    description: 'Pipeline operation ID.'
+    value: ${{ steps.run.outputs.operation-id }}
+  backup-id:
+    description: 'Snapshot/backup ID for manual rollback (empty if no snapshot taken).'
+    value: ${{ steps.run.outputs.backup-id }}
+  records-extracted:
+    description: 'Records extracted from the source org.'
+    value: ${{ steps.run.outputs.records-extracted }}
+  records-loaded:
+    description: 'Records successfully loaded into the target org.'
+    value: ${{ steps.run.outputs.records-loaded }}
+  records-failed:
+    description: 'Records that failed to load.'
+    value: ${{ steps.run.outputs.records-failed }}
+  residual-pii-count:
+    description: 'PII findings remaining in the anonymized data at or above residual-pii-fail-on.'
+    value: ${{ steps.run.outputs.residual-pii-count }}
+  report-path:
+    description: 'Path to the run report JSON.'
+    value: ${{ steps.run.outputs.report-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.dry-run }}" != "true" ]]; then
+          if [[ -z "${{ inputs.target-access-token }}" || -z "${{ inputs.target-instance-url }}" ]]; then
+            echo "::error::target-access-token and target-instance-url are required unless dry-run=true."
+            exit 1
+          fi
+        fi
+
+    - name: Resolve release tag
+      id: tag
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.version }}" == "latest" ]]; then
+          tag=$(gh release view --repo "${{ inputs.binary-repo }}" --json tagName -q .tagName)
+        else
+          tag="${{ inputs.version }}"
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Determine asset name
+      id: asset
+      shell: bash
+      run: |
+        set -euo pipefail
+        os="${{ runner.os }}"
+        arch="${{ runner.arch }}"
+        case "$os-$arch" in
+          Linux-X64)   name="busbar-sf-x86_64-unknown-linux-gnu" ;;
+          Linux-ARM64) name="busbar-sf-aarch64-unknown-linux-gnu" ;;
+          macOS-X64)   name="busbar-sf-x86_64-apple-darwin" ;;
+          macOS-ARM64) name="busbar-sf-aarch64-apple-darwin" ;;
+          Windows-X64) name="busbar-sf-x86_64-pc-windows-msvc.exe" ;;
+          *) echo "::error::Unsupported runner: $os-$arch"; exit 1 ;;
+        esac
+        echo "name=$name" >> "$GITHUB_OUTPUT"
+
+    - name: Download busbar-sf binary
+      shell: bash
+      run: |
+        set -euo pipefail
+        bin_dir="${RUNNER_TEMP}/busbar-sf"
+        mkdir -p "$bin_dir"
+        gh release download "${{ steps.tag.outputs.tag }}" \
+          --repo "${{ inputs.binary-repo }}" \
+          --pattern "${{ steps.asset.outputs.name }}" \
+          --dir "$bin_dir"
+        bin_path="$bin_dir/${{ steps.asset.outputs.name }}"
+        chmod +x "$bin_path"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        if [[ "$bin_path" != "$bin_dir/busbar-sf" && "$bin_path" != "$bin_dir/busbar-sf.exe" ]]; then
+          ext=""
+          [[ "${{ runner.os }}" == "Windows" ]] && ext=".exe"
+          ln -sf "$bin_path" "$bin_dir/busbar-sf$ext"
+        fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Run pipeline
+      id: run
+      shell: bash
+      env:
+        SF_SOURCE_ACCESS_TOKEN: ${{ inputs.source-access-token }}
+        SF_SOURCE_INSTANCE_URL: ${{ inputs.source-instance-url }}
+        SF_TARGET_ACCESS_TOKEN: ${{ inputs.target-access-token }}
+        SF_TARGET_INSTANCE_URL: ${{ inputs.target-instance-url }}
+      run: |
+        set -euo pipefail
+        report="${{ inputs.output-dir }}/report.json"
+        mkdir -p "${{ inputs.output-dir }}"
+
+        args=(data pipeline
+          --config "${{ inputs.config-file }}"
+          --output "${{ inputs.output-dir }}"
+          --report "$report"
+          --json)
+
+        if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+          args+=(--dry-run)
+        fi
+        if [[ "${{ inputs.snapshot }}" == "true" ]]; then
+          args+=(--snapshot)
+        fi
+        if [[ "${{ inputs.rollback-on-failure }}" == "true" ]]; then
+          args+=(--rollback-on-failure)
+        fi
+        if [[ "${{ inputs.validate-residual-pii }}" == "true" ]]; then
+          args+=(--validate-residual-pii --residual-pii-fail-on "${{ inputs.residual-pii-fail-on }}")
+        fi
+
+        set +e
+        busbar-sf "${args[@]}"
+        run_exit=$?
+        set -e
+
+        # Parse the report for outputs.
+        op_id=""; backup=""; extracted=0; loaded=0; failed=0; residual=0; status="failed"
+        if [[ -f "$report" ]]; then
+          op_id=$(jq -r '.operation_id // ""' "$report")
+          backup=$(jq -r '.backup_id // ""' "$report")
+          extracted=$(jq -r '.records_extracted // .records_processed // 0' "$report")
+          loaded=$(jq -r '.records_success // 0' "$report")
+          failed=$(jq -r '.records_failed // 0' "$report")
+          residual=$(jq -r '.residual_pii_count // 0' "$report")
+          status=$(jq -r '.status // (if .success then "success" else "failed" end)' "$report")
+        fi
+
+        echo "operation-id=$op_id"        >> "$GITHUB_OUTPUT"
+        echo "backup-id=$backup"          >> "$GITHUB_OUTPUT"
+        echo "records-extracted=$extracted" >> "$GITHUB_OUTPUT"
+        echo "records-loaded=$loaded"     >> "$GITHUB_OUTPUT"
+        echo "records-failed=$failed"     >> "$GITHUB_OUTPUT"
+        echo "residual-pii-count=$residual" >> "$GITHUB_OUTPUT"
+        echo "status=$status"             >> "$GITHUB_OUTPUT"
+        echo "report-path=$report"        >> "$GITHUB_OUTPUT"
+        echo "$run_exit" > "${RUNNER_TEMP}/run_exit"
+
+    - name: Job summary
+      if: always()
+      shell: bash
+      env:
+        STATUS: ${{ steps.run.outputs.status }}
+        OP: ${{ steps.run.outputs.operation-id }}
+        BACKUP: ${{ steps.run.outputs.backup-id }}
+        EXTRACTED: ${{ steps.run.outputs.records-extracted }}
+        LOADED: ${{ steps.run.outputs.records-loaded }}
+        FAILED: ${{ steps.run.outputs.records-failed }}
+        RESIDUAL: ${{ steps.run.outputs.residual-pii-count }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### 🔀 busbar anonymize-extract"
+          echo ""
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Status | \`${STATUS:-unknown}\` |"
+          echo "| Operation ID | \`${OP:-—}\` |"
+          echo "| Backup ID (rollback) | \`${BACKUP:-none}\` |"
+          echo "| Records extracted | ${EXTRACTED:-0} |"
+          echo "| Records loaded | ${LOADED:-0} |"
+          echo "| Records failed | ${FAILED:-0} |"
+          echo "| Residual PII findings | ${RESIDUAL:-0} |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload run report
+      if: always() && inputs.upload-artifact == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.run.outputs.report-path }}
+        if-no-files-found: ignore
+
+    - name: Upload data artifact
+      if: always() && inputs.upload-data == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}-data
+        path: ${{ inputs.output-dir }}
+        if-no-files-found: ignore
+
+    - name: Propagate exit status
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        code="$(cat "${RUNNER_TEMP}/run_exit" 2>/dev/null || echo 1)"
+        if [[ "$code" -ne 0 ]]; then
+          echo "::error::Pipeline finished with status '${{ steps.run.outputs.status }}'."
+          exit "$code"
+        fi
