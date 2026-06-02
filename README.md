@@ -1,26 +1,26 @@
 # busbar-actions/sf-anonymize-extract
 
-Extract data from a source Salesforce org, anonymize PII, and load it into a target sandbox — with residual-PII validation before load, a pre-load snapshot, and rollback on failure.
+Extract data from a source Salesforce org, anonymize PII, and load it into a target sandbox — with residual-PII validation before load, a pre-load snapshot, and a backup-id for manual rollback.
 
-Built on the `sf-datasets` pipeline: `Pipeline` executor, `TransformChain` with `fake`-crate anonymization, `BackupManager` / `RollbackManager` snapshots, and the PII `validator`.
+Backed by the **dedicated `sf-anonymize-extract` binary** (NOT `busbar-sf`). It is typesynth-free: it consumes the schema-free `sf-dataset-core` (dataset types, CSV storage, the PII `DataValidator`, and the `fake`-based anonymization engine), `busbar-auth` (explicit source/target sessions), and `busbar-sf-bulk` (Bulk API 2.0 query + ingest). It replaces the never-implemented `busbar-sf data pipeline`.
 
 ## What it does
 
-Wraps `busbar-sf data pipeline`, driven by a YAML config that defines the extraction mapping, anonymization rules, and load settings. The flow:
+Driven by a YAML config that defines the extraction mapping, anonymization rules, and load settings. The flow:
 
-1. **Extract** from the source org (Bulk API 2.0, dependency-ordered).
-2. **Anonymize** per the config's transform rules (`fake`-generated names/emails/etc., value mappings, masking).
+1. **Extract** from the source org (Bulk API 2.0).
+2. **Anonymize** per the config's transform rules (`fake`-generated names/emails/etc.).
 3. **Validate residual PII** on the anonymized output. If PII at or above `residual-pii-fail-on` remains, the load is **aborted** — anonymized data that still contains PII never reaches the target.
-4. **Snapshot** the target objects (so the run is reversible).
-5. **Load** into the target org.
-6. **Roll back** to the snapshot if the load partially fails (when enabled).
+4. **Snapshot** the target objects to a local backup (so the run is reversible), or a Salesforce `OrgSnapshot` if the target is a scratch org (`SF_TARGET_SCRATCH_ORG_ID`).
+5. **Load** into the target org (Bulk insert).
+6. **Manual rollback**: on a partial load failure with `rollback-on-failure=true`, the run surfaces `backup-id` and fails — an operator restores the target by hand from the backup. **Automated in-place restore is out of scope for v1.**
 
 ## Safety model
 
 - **Two orgs, clearly separated**: `source-*` (read) and `target-*` (write) credentials.
 - **Residual-PII gate before load** is on by default — the load only proceeds if the anonymized data is clean.
 - **Dry-run** extracts + anonymizes + validates without touching the target.
-- **Snapshot + rollback** on by default so a failed load doesn't leave the target in a partial state.
+- **Snapshot** on by default so a failed load can be undone — but rollback is **manual** (restore from `backup-id`); v1 does not perform an automated in-place restore.
 - **Data is not uploaded as an artifact by default** — even anonymized data can be sensitive. Only the run report is.
 
 ## Inputs
@@ -34,21 +34,21 @@ Wraps `busbar-sf data pipeline`, driven by a YAML config that defines the extrac
 | `config-file` | yes | — | Pipeline config YAML (mapping + anonymization + load). |
 | `dry-run` | no | `false` | Extract + anonymize + validate, but don't load. |
 | `snapshot` | no | `true` | Snapshot target objects before load. |
-| `rollback-on-failure` | no | `true` | Roll target back to snapshot on partial load failure. |
+| `rollback-on-failure` | no | `true` | On partial load failure, surface the `backup-id` for MANUAL rollback (v1: no automated restore). |
 | `validate-residual-pii` | no | `true` | Validate anonymized data before load; abort on breach. |
 | `residual-pii-fail-on` | no | `high` | Residual-PII severity that aborts the load. |
 | `output-dir` | no | `.busbar/pipeline-runs` | Where data + report are written. |
 | `upload-artifact` | no | `true` | Upload the run report. |
 | `artifact-name` | no | `pipeline-run` | Artifact name. |
 | `upload-data` | no | `false` | Also upload extracted/anonymized data (off by default). |
-| `version` | no | `latest` | `busbar-sf` release tag. |
+| `version` | no | `latest` | `sf-anonymize-extract` release tag. |
 | `binary-repo` | no | `busbar-actions/actions-dist` | Where to fetch the binary. |
 
 ## Outputs
 
 | Output | Description |
 |---|---|
-| `status` | `success`, `dry-run`, `residual-pii-blocked`, `failed`, or `rolled-back`. |
+| `status` | `success`, `dry-run`, `residual-pii-blocked`, or `failed`. |
 | `operation-id` | Pipeline operation ID. |
 | `backup-id` | Snapshot ID for manual rollback (empty if no snapshot). |
 | `records-extracted` | Records extracted from source. |
@@ -118,30 +118,41 @@ jobs:
 
 ## Pipeline config
 
-The `config-file` is a `sf-datasets` `PipelineConfig` YAML — extraction mapping, `AnonymizationPattern` rules per field, value mappings, and load settings. See `crates/sf-datasets/src/pipeline/config.rs` for the schema.
+The `config-file` is a focused YAML consumed by the `sf-anonymize-extract` binary (it does **not** reuse the entangled `sf-datasets` `PipelineConfig`). Each object lists the fields to extract and the per-field anonymization rules; fields without a rule are loaded verbatim:
 
-## Dependencies (current status)
+```yaml
+objects:
+  - api_name: Contact
+    # `fields` builds `SELECT Id, <fields> FROM Contact`. Id is always included.
+    fields: [FirstName, LastName, Email, Phone]
+    anonymization:
+      FirstName: { pattern: first_name }
+      LastName:  { pattern: last_name }
+      Email:     { pattern: email }
+      Phone:     { pattern: phone }
+    # limit: 5000          # optional row cap for extraction
+  - api_name: Account
+    fields: [Name, Phone]
+    anonymization:
+      Name:  { pattern: company_name }
+      Phone: { pattern: phone }
 
-This action is fully scaffolded but **not yet runnable end-to-end**. Pieces that need to land:
+# Optional load options.
+load:
+  operation: insert        # insert | update | upsert
+  # external_id_field: External_Id__c   # required for upsert
+```
 
-1. **`busbar-sf data pipeline` subcommand** — the `sf-datasets` pipeline pieces (`Pipeline`, `TransformChain`, `BackupManager`, `RollbackManager`, `validator`) exist as library; today's CLI only exposes the individual `data extract` / `data load` steps. The full orchestration needs a single command:
+`pattern` values are the `AnonymizationPattern` variants from `sf-dataset-core` (`first_name`, `last_name`, `full_name`, `email`, `username`, `phone`, `street`, `city`, `state`, `country`, `zip_code`, `full_address`, `company_name`, `job_title`, `industry`, `url`, `domain_name`, `ip_address`, `sentence`, `paragraph`, `word`, `uuid`, `fixed`, `null`, …). See `crates/sf-dataset-core/src/anonymize.rs`.
 
-   ```
-   busbar-sf data pipeline \
-     --config <pipeline.yml> \
-     --output <dir> \
-     --report <report.json> \
-     [--dry-run] \
-     [--snapshot] \
-     [--rollback-on-failure] \
-     [--validate-residual-pii --residual-pii-fail-on <severity>] \
-     [--json]
-   ```
+> Note: raw `soql` is not supported — the safe Bulk `QueryBuilder` builds the SELECT from `fields`. Use `fields: [...]`.
 
-   Dual-org auth via env: `SF_SOURCE_ACCESS_TOKEN` / `SF_SOURCE_INSTANCE_URL` (extract) and `SF_TARGET_ACCESS_TOKEN` / `SF_TARGET_INSTANCE_URL` (load). **All SF API interactions must go through `busbar_sf_api`**; metadata/types via `busbar_sf_types`.
+## How it runs
 
-   The command must enforce the residual-PII gate *before* any load, write the existing `PipelineResult` shape to `--report` (plus `status` and `residual_pii_count` fields the action reads), and exit non-zero on `failed` / `residual-pii-blocked` / `rolled-back`.
+The action installs the prebuilt `sf-anonymize-extract` binary from `busbar-actions/actions-dist` (via `busbar-actions/setup`), then runs it once. The binary reads its `INPUT_*` inputs plus the two-org env (`SF_SOURCE_ACCESS_TOKEN`/`SF_SOURCE_INSTANCE_URL` for extract, `SF_TARGET_ACCESS_TOKEN`/`SF_TARGET_INSTANCE_URL` for load), performs extract → anonymize → residual-PII gate → snapshot → load, writes the report JSON, emits `GITHUB_OUTPUT`/step-summary/annotations itself, and exits non-zero on a residual-PII block or load failure.
 
-2. **Binary publication to `busbar-actions/actions-dist`** — same dependency as the other actions.
+Auth uses explicit per-org `busbar-auth` sessions (`CredentialContext::new` + `SalesforceSession::new`), not `session_from_env` (which only reads a single `SF_ACCESS_TOKEN`).
 
-Once both land, tag this action `v1` and consumers can pin it.
+### Manual rollback
+
+`rollback-on-failure` does **not** restore the target automatically in v1. The `snapshot` step writes a real, restorable backup of the target's current records to `<output-dir>/target-backup/` (or creates a Salesforce `OrgSnapshot` when the target is a scratch org and `SF_TARGET_SCRATCH_ORG_ID` is set). On a partial load failure the run fails and surfaces that `backup-id` so an operator can restore the target by hand.

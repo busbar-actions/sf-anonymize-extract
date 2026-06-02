@@ -7,7 +7,7 @@
     "category": "data",
     "icon": "pipeline",
     "blurb": "Extract data from a source org, anonymize it, and load it into a target sandbox.",
-    "longDescription": "Extracts from the source org, anonymizes PII through the transform chain, validates residual PII before load, and snapshots the target for rollback on failure.",
+    "longDescription": "Backed by the dedicated, typesynth-free `sf-anonymize-extract` binary (not `busbar-sf`). Extracts from the source org via the Bulk API, anonymizes PII through the fake-based transform engine, validates residual PII before load (aborting if PII remains), snapshots the target for rollback, and loads into the target. Rollback is MANUAL via the backup-id (no automated in-place restore in v1).",
     "version": "v1",
     "compatibility": "fits",
     "compatibilityNote": null,
