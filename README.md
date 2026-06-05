@@ -1,8 +1,13 @@
+> [!WARNING]
+> **`busbar-actions` is under heavy active development — expect breaking changes.**
+> These repositories are public, but **not ready for use yet** — please don't depend on them.
+> A pilot is starting soon: **[star and watch the busbar-actions organization](https://github.com/busbar-actions)** for the launch of Discussions and the pilot announcement.
+
 # busbar-actions/sf-anonymize-extract
 
 Extract data from a source Salesforce org, anonymize PII, and load it into a target sandbox — with residual-PII validation before load, a pre-load snapshot, and a backup-id for manual rollback.
 
-Backed by the **dedicated `sf-anonymize-extract` binary** (NOT `busbar-sf`). It is typesynth-free: it consumes the schema-free `sf-dataset-core` (dataset types, CSV storage, the PII `DataValidator`, and the `fake`-based anonymization engine), `busbar-auth` (explicit source/target sessions), and `busbar-sf-bulk` (Bulk API 2.0 query + ingest). It replaces the never-implemented `busbar-sf data pipeline`.
+Backed by the **dedicated `sf-anonymize-extract` binary** (NOT `busbar-sf`). It is typesynth-free: it consumes the schema-free `sf-dataset-core` (dataset types, CSV storage, the PII `DataValidator`, and the `fake`-based anonymization engine), `busbar-auth` (per-org OIDC self-mint of the source/target sessions), and `busbar-sf-bulk` (Bulk API 2.0 query + ingest). It replaces the never-implemented `busbar-sf data pipeline`.
 
 ## What it does
 
@@ -27,11 +32,18 @@ Driven by a YAML config that defines the extraction mapping, anonymization rules
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `source-access-token` | yes | — | SOURCE org token (extract from). |
-| `source-instance-url` | yes | — | SOURCE org instance URL. |
-| `target-access-token` | no* | `` | TARGET org token (load into). *Required unless `dry-run=true`. |
-| `target-instance-url` | no* | `` | TARGET org instance URL. *Required unless `dry-run=true`. |
+| `source-instance` | yes† | `` | Instance URL of the SOURCE org (a Salesforce org with Busbar installed and trust established). The source session **self-mints its own short-lived token via GitHub OIDC**, bound to this org — no token handoff. Requires `permissions: id-token: write`. Mapped to `SF_SOURCE_INSTANCE_URL`. |
+| `target-instance` | no\* | `` | Instance URL of the TARGET org (Busbar installed + trust established). The target session self-mints in-process via OIDC. Required unless `dry-run=true`. |
+| `eca-client-id` | no | `` | Override the External Client App consumer key for the OIDC exchange. PBO-pinned default. |
+| `token-handler` | no | `` | Override the Apex token-exchange handler dev name. Defaults to `BBGitHubTokenExchangeHandler`. |
+| `oidc-audience` | no | `` | Override the audience requested in the GitHub OIDC token. Defaults to each leg's instance URL. |
+| `source-access-token` | no | `` | **Local-dev override only.** Raw SOURCE org token; leave empty in CI so the source leg self-mints via OIDC. When set, the source leg skips OIDC. |
+| `source-instance-url` | no | `` | **Local-dev override only.** SOURCE org instance URL paired with `source-access-token`. In CI use `source-instance`. |
+| `target-access-token` | no | `` | **Local-dev override only.** Raw TARGET org token; leave empty in CI so the target leg self-mints via OIDC. |
+| `target-instance-url` | no | `` | **Local-dev override only.** TARGET org instance URL paired with `target-access-token`. In CI use `target-instance`. |
 | `config-file` | yes | — | Pipeline config YAML (mapping + anonymization + load). |
+
+> † `source-instance` is required in CI (the source leg self-mints from it via OIDC); you may instead supply `source-instance-url` for the local-dev token path. \* `target-instance` is required unless `dry-run=true`. The binary self-mints **both** org sessions in-process via GitHub OIDC (`busbar-auth` `oidc_session_for`, bound per leg to that org); the `*-access-token` inputs are a local-dev override that bypasses OIDC for that leg. See the Auth model below.
 | `dry-run` | no | `false` | Extract + anonymize + validate, but don't load. |
 | `snapshot` | no | `true` | Snapshot target objects before load. |
 | `rollback-on-failure` | no | `true` | On partial load failure, surface the `backup-id` for MANUAL rollback (v1: no automated restore). |
@@ -72,6 +84,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write                # each org leg self-mints via OIDC
 
 jobs:
   refresh:
@@ -82,10 +95,8 @@ jobs:
 
       - uses: busbar-actions/sf-anonymize-extract@v1
         with:
-          source-access-token: ${{ secrets.SF_PROD_ACCESS_TOKEN }}
-          source-instance-url: ${{ secrets.SF_PROD_INSTANCE_URL }}
-          target-access-token: ${{ secrets.SF_SANDBOX_ACCESS_TOKEN }}
-          target-instance-url: ${{ secrets.SF_SANDBOX_INSTANCE_URL }}
+          source-instance: ${{ vars.SF_PROD_INSTANCE_URL }}
+          target-instance: ${{ vars.SF_SANDBOX_INSTANCE_URL }}
           config-file: .busbar/pipelines/sandbox-refresh.yml
           dry-run: ${{ inputs.dry-run }}
 ```
@@ -102,6 +113,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write                # the source leg self-mints via OIDC
 
 jobs:
   dry-run:
@@ -110,8 +122,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: busbar-actions/sf-anonymize-extract@v1
         with:
-          source-access-token: ${{ secrets.SF_PROD_ACCESS_TOKEN }}
-          source-instance-url: ${{ secrets.SF_PROD_INSTANCE_URL }}
+          source-instance: ${{ vars.SF_PROD_INSTANCE_URL }}
           config-file: .busbar/pipelines/sandbox-refresh.yml
           dry-run: true
 ```
@@ -149,10 +160,40 @@ load:
 
 ## How it runs
 
-The action installs the prebuilt `sf-anonymize-extract` binary from `busbar-actions/actions-dist` (via `busbar-actions/setup`), then runs it once. The binary reads its `INPUT_*` inputs plus the two-org env (`SF_SOURCE_ACCESS_TOKEN`/`SF_SOURCE_INSTANCE_URL` for extract, `SF_TARGET_ACCESS_TOKEN`/`SF_TARGET_INSTANCE_URL` for load), performs extract → anonymize → residual-PII gate → snapshot → load, writes the report JSON, emits `GITHUB_OUTPUT`/step-summary/annotations itself, and exits non-zero on a residual-PII block or load failure.
+The action installs the prebuilt `sf-anonymize-extract` binary from `busbar-actions/actions-dist` (via `busbar-actions/setup`), then runs it once. The binary reads its `INPUT_*` inputs plus the two-org env (`SF_SOURCE_INSTANCE_URL` for extract, `SF_TARGET_INSTANCE_URL` for load) and **self-mints each leg's token in-process via GitHub OIDC** (`SF_SOURCE_ACCESS_TOKEN` / `SF_TARGET_ACCESS_TOKEN` are a local-dev override only). It performs extract → anonymize → residual-PII gate → snapshot → load, writes the report JSON, emits `GITHUB_OUTPUT`/step-summary/annotations itself, and exits non-zero on a residual-PII block or load failure.
 
-Auth uses explicit per-org `busbar-auth` sessions (`CredentialContext::new` + `SalesforceSession::new`), not `session_from_env` (which only reads a single `SF_ACCESS_TOKEN`).
+Auth uses per-org `busbar-auth` OIDC sessions (`oidc_session_for`, bound per leg to that org's instance URL). See the Auth model below.
 
-### Manual rollback
+## Auth model (OIDC self-mint)
+
+The Busbar security principle is that a Salesforce access token must NEVER be handed to a script, written to `GITHUB_ENV`, passed as an action input/output, or persisted — each binary mints its OWN short-lived token in-process from the runner's GitHub OIDC id-token, holds it only in zeroizing memory, and revokes + zeroizes it (`session.dispose()`) at exit. The sibling actions `sf-schema` and `sf-metadata-retrieve` do this with `busbar-auth` `session_from_env` (one org per job).
+
+This action drives **two** orgs in one job, so it self-mints **both** legs independently via `busbar-auth` `oidc_session_for(<instance_url>)` — the per-instance variant that binds the OIDC exchange (and audience) to a specific org so a leaked token can't be replayed elsewhere:
+
+- **Each leg self-mints via OIDC.** The source session is minted from `source-instance` and the target session from `target-instance`; no Salesforce token is ever handed to the binary. The caller job MUST grant `permissions: id-token: write`.
+- **Both orgs must have Busbar installed and a trust relationship established** for the calling repo/workflow. An exchange with no matching trust rule fails the run with a pending-approval message — approve it in the org and re-run.
+- `dispose()` is called on **both** sessions on success *and* on error; for an OIDC-minted leg it **revokes** the token at the org and zeroizes it. The extracted access-token string is held in `zeroize::Zeroizing` so its bytes are wiped on drop.
+- **Local-dev override:** set `SF_SOURCE_ACCESS_TOKEN` / `SF_TARGET_ACCESS_TOKEN` (via the `*-access-token` inputs) to skip OIDC for that leg and use a raw token directly. Those sessions are zeroize-only on dispose (there's nothing of ours to revoke). Use this only for local/manual runs.
+
+In CI, supply only the instance URLs and grant `id-token: write`:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write          # REQUIRED: lets each org leg self-mint via OIDC
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: busbar-actions/sf-anonymize-extract@v1
+        with:
+          source-instance: ${{ vars.SF_PROD_INSTANCE_URL }}
+          target-instance: ${{ vars.SF_SANDBOX_INSTANCE_URL }}
+          config-file: .busbar/pipelines/sandbox-refresh.yml
+```
+
+## Manual rollback
 
 `rollback-on-failure` does **not** restore the target automatically in v1. The `snapshot` step writes a real, restorable backup of the target's current records to `<output-dir>/target-backup/` (or creates a Salesforce `OrgSnapshot` when the target is a scratch org and `SF_TARGET_SCRATCH_ORG_ID` is set). On a partial load failure the run fails and surfaces that `backup-id` so an operator can restore the target by hand.

@@ -6,18 +6,64 @@ branding:
   color: 'green'
 
 inputs:
+  # ---- OIDC self-mint inputs (org instance URLs) ----
+  # OIDC-first: the binary self-mints BOTH org sessions in-process from the
+  # runner's GitHub OIDC id-token (busbar-auth `oidc_session_for`, bound per leg
+  # to that org's instance URL) — no token is handed off. source-instance drives
+  # the SOURCE leg (SF_SOURCE_INSTANCE_URL), target-instance the TARGET leg
+  # (SF_TARGET_INSTANCE_URL). Each org must have Busbar installed and a trust
+  # relationship established for this repo/workflow. The caller job MUST grant
+  # `permissions: id-token: write`. The *-access-token inputs are a LOCAL-DEV
+  # override only (when set, that leg skips OIDC and uses the raw token).
+  source-instance:
+    description: |
+      Instance URL of the SOURCE org (a Salesforce org with Busbar installed and
+      trust established), e.g. https://yourdomain.my.salesforce.com. Mapped to
+      SF_SOURCE_INSTANCE_URL; the source session self-mints its own short-lived
+      token via GitHub OIDC, bound to this org. Requires the caller job to grant
+      `permissions: id-token: write`.
+    required: false
+    default: ''
+  target-instance:
+    description: |
+      Instance URL of the TARGET org (a Salesforce org with Busbar installed and
+      trust established). Mapped to SF_TARGET_INSTANCE_URL; the target session
+      self-mints in-process via GitHub OIDC, bound to this org. Required unless
+      dry-run=true (or supply target-instance-url for the local-dev token path).
+    required: false
+    default: ''
+
+  eca-client-id:
+    description: 'OPTIONAL override of the External Client App consumer key (client_id) for the OIDC exchange. PBO-pinned default; set only on a consumer-key rotation.'
+    required: false
+    default: ''
+  token-handler:
+    description: 'OPTIONAL override of the Apex token-exchange handler dev name. Defaults to BBGitHubTokenExchangeHandler.'
+    required: false
+    default: ''
+  oidc-audience:
+    description: 'OPTIONAL override of the audience requested in the GitHub OIDC token. Defaults to the source-instance URL.'
+    required: false
+    default: ''
+
+  # ---- Local-dev token override (OPTIONAL; bypasses OIDC for that leg) ----
+  # In steady state leave these EMPTY and let the binary self-mint via OIDC from
+  # source-instance / target-instance. Set them only for local/manual runs where
+  # you already hold a raw token; when present, that leg skips OIDC entirely.
   source-access-token:
-    description: 'Access token for the SOURCE org (extract from). Provide via secret.'
-    required: true
+    description: 'LOCAL-DEV ONLY: raw access token for the SOURCE org. Leave empty in CI — the source leg self-mints via OIDC from source-instance. When set, the source leg skips OIDC and uses this token.'
+    required: false
+    default: ''
   source-instance-url:
-    description: 'Instance URL for the SOURCE org.'
-    required: true
+    description: 'LOCAL-DEV ONLY: SOURCE org instance URL paired with source-access-token. In CI use source-instance instead.'
+    required: false
+    default: ''
   target-access-token:
-    description: 'Access token for the TARGET org (load into). Provide via secret. Required unless dry-run=true.'
+    description: 'LOCAL-DEV ONLY: raw access token for the TARGET org. Leave empty in CI — the target leg self-mints via OIDC from target-instance. When set, the target leg skips OIDC and uses this token.'
     required: false
     default: ''
   target-instance-url:
-    description: 'Instance URL for the TARGET org. Required unless dry-run=true.'
+    description: 'LOCAL-DEV ONLY: TARGET org instance URL paired with target-access-token. In CI use target-instance instead.'
     required: false
     default: ''
 
@@ -111,33 +157,55 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Validate inputs
+    - name: Validate the source/target instance-URL invariant for the dry-run mode
       shell: bash
       run: |
         set -euo pipefail
+        echo "Validating that a SOURCE instance URL is set (and a TARGET instance URL unless dry-run=true)"
+        # OIDC-first: a SOURCE instance URL is always required (the binary
+        # self-mints the source token from GitHub OIDC, bound to that org). The
+        # access tokens are a local-dev override and are NOT required in CI.
+        if [[ -z "${{ inputs.source-instance }}" && -z "${{ inputs.source-instance-url }}" ]]; then
+          echo "::error::a SOURCE instance URL is required: set source-instance (OIDC self-mint) or source-instance-url (local-dev token path)."
+          exit 1
+        fi
         if [[ "${{ inputs.dry-run }}" != "true" ]]; then
-          if [[ -z "${{ inputs.target-access-token }}" || -z "${{ inputs.target-instance-url }}" ]]; then
-            echo "::error::target-access-token and target-instance-url are required unless dry-run=true."
+          # A real load needs a TARGET instance URL; OIDC mints the target token.
+          if [[ -z "${{ inputs.target-instance }}" && -z "${{ inputs.target-instance-url }}" ]]; then
+            echo "::error::a TARGET instance URL is required unless dry-run=true: set target-instance (OIDC self-mint) or target-instance-url (local-dev token path)."
             exit 1
           fi
         fi
 
-    - name: Set up sf-anonymize-extract
+    - name: Install the sf-anonymize-extract binary from actions-dist
       uses: busbar-actions/setup@main
       with:
         binary: sf-anonymize-extract
         version: ${{ inputs.version }}
         binary-repo: ${{ inputs.binary-repo }}
 
-    - name: Run pipeline
+    - name: Extract from the source Busbar-equipped org, anonymize, gate residual PII, and load into the target org
       id: run
       shell: bash
       env:
-        # Two orgs, clearly separated: SF_SOURCE_* (read) and SF_TARGET_* (write).
+        # ---- Two orgs, clearly separated: SF_SOURCE_* (read) and SF_TARGET_* (write). ----
+        # OIDC-first: the binary reads each leg's instance URL and self-mints that
+        # leg's token in-process via GitHub OIDC (busbar-auth `oidc_session_for`),
+        # bound to the org. The SF_*_ACCESS_TOKEN vars are a LOCAL-DEV override —
+        # empty in CI, so the OIDC exchange runs; when set, that leg skips OIDC.
         SF_SOURCE_ACCESS_TOKEN: ${{ inputs.source-access-token }}
-        SF_SOURCE_INSTANCE_URL: ${{ inputs.source-instance-url }}
+        SF_SOURCE_INSTANCE_URL: ${{ inputs.source-instance != '' && inputs.source-instance || inputs.source-instance-url }}
         SF_TARGET_ACCESS_TOKEN: ${{ inputs.target-access-token }}
-        SF_TARGET_INSTANCE_URL: ${{ inputs.target-instance-url }}
+        SF_TARGET_INSTANCE_URL: ${{ inputs.target-instance != '' && inputs.target-instance || inputs.target-instance-url }}
+        # The OIDC config (ECA client id, Apex token handler, audience) is read
+        # from these vars by busbar-auth's OidcExchangeConfig::from_env. It also
+        # requires a non-empty SF_INSTANCE_URL to construct — oidc_session_for then
+        # OVERRIDES the instance_url + audience per leg from the source/target URL,
+        # so SF_INSTANCE_URL is just the required seed (set from the source org).
+        SF_INSTANCE_URL: ${{ inputs.source-instance != '' && inputs.source-instance || inputs.source-instance-url }}
+        ECA_CLIENT_ID: ${{ inputs.eca-client-id }}
+        TOKEN_HANDLER_APEX: ${{ inputs.token-handler }}
+        OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
         # Action inputs surfaced as the INPUT_* contract the binary reads.
         INPUT_CONFIG_FILE: ${{ inputs.config-file }}
         INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
@@ -147,20 +215,23 @@ runs:
         INPUT_ROLLBACK_ON_FAILURE: ${{ inputs.rollback-on-failure }}
         INPUT_VALIDATE_RESIDUAL_PII: ${{ inputs.validate-residual-pii }}
         INPUT_RESIDUAL_PII_FAIL_ON: ${{ inputs.residual-pii-fail-on }}
-      run: sf-anonymize-extract
+      run: |
+        set -euo pipefail
+        echo "Running extract -> anonymize -> residual-PII gate ('${INPUT_RESIDUAL_PII_FAIL_ON}') -> load: source=${SF_SOURCE_INSTANCE_URL} target=${SF_TARGET_INSTANCE_URL} dry-run='${INPUT_DRY_RUN}' config='${INPUT_CONFIG_FILE}'"
+        sf-anonymize-extract
 
-    - name: Upload run report
+    - name: Upload the anonymize-extract run report JSON as a workflow artifact
       if: always() && inputs.upload-artifact == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ steps.run.outputs.report-path }}
-        if-no-files-found: ignore
+        if-no-files-found: error
 
-    - name: Upload data artifact
+    - name: Upload the extracted and anonymized data as a workflow artifact
       if: always() && inputs.upload-data == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}-data
         path: ${{ inputs.output-dir }}
-        if-no-files-found: ignore
+        if-no-files-found: error
