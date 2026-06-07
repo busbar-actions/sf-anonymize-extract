@@ -226,6 +226,9 @@ runs:
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ steps.run.outputs.report-path }}
+        # report/output paths live under .busbar (dot-dir); upload-artifact@v4
+        # excludes hidden files by default — opt in so the artifacts aren't empty.
+        include-hidden-files: true
         if-no-files-found: error
 
     - name: Upload the extracted and anonymized data as a workflow artifact
@@ -234,4 +237,5 @@ runs:
       with:
         name: ${{ inputs.artifact-name }}-data
         path: ${{ inputs.output-dir }}
+        include-hidden-files: true
         if-no-files-found: error
